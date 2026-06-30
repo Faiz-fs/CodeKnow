@@ -1,0 +1,151 @@
+{
+  "info": {
+    "name": "CodeKnow",
+    "description": "CodeKnow codebase intelligence API — local dev collection. Base URL points to the FastAPI backend on port 8080. All endpoints live under the /codeknow prefix.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "codeknow-0.1.0"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080", "type": "string" },
+    { "key": "prefix", "value": "/codeknow", "type": "string" },
+    { "key": "token", "value": "", "type": "string", "description": "JWT from the GitHub login flow. Set automatically by the login request's test script, or paste manually." }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "health"]
+            },
+            "description": "Liveness check. Returns { \"status\": \"ok\" }."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Auth — GitHub OAuth",
+      "item": [
+        {
+          "name": "GitHub login (open in browser)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/auth/github/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "auth", "github", "login"]
+            },
+            "description": "This endpoint returns a 307 redirect to GitHub's OAuth consent screen. It is meant to run in a browser, not respond with JSON — so open this URL directly in your browser:\n\nhttp://localhost:8080/codeknow/auth/github/login\n\nAfter authorizing, GitHub redirects back to /codeknow/auth/github/callback, which mints a JWT. Make sure the callback URL is registered in your GitHub OAuth App settings:\n\nhttp://localhost:8080/codeknow/auth/github/callback"
+          },
+          "response": [],
+          "event": []
+        },
+        {
+          "name": "GitHub callback (simulate with code)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/auth/github/callback?code=YOUR_AUTH_CODE&state=YOUR_STATE",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "auth", "github", "callback"],
+              "query": [
+                { "key": "code", "value": "YOUR_AUTH_CODE", "description": "Temporary code from GitHub after user authorizes." },
+                { "key": "state", "value": "YOUR_STATE", "description": "Signed state returned alongside the code (CSRF protection)." }
+              ]
+            },
+            "description": "Exchange an OAuth code for a CodeKnow JWT.\n\nHow to get code + state for local testing:\n1. Open {{baseUrl}}{{prefix}}/auth/github/login in your browser.\n2. Authorize the app.\n3. After redirect, your browser lands on the callback URL with ?code=...&state=... in the address bar — copy both values into this request.\n\nIf FRONTEND_REDIRECT is set, the callback returns a 307 redirect instead of JSON (see backend .env.example). For API testing, leave FRONTEND_REDIRECT blank so this returns JSON.\n\nOn success, the response body contains access_token, token_type, and user. The test script below auto-saves the token into the {{token}} collection variable."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "try {",
+                  "  const json = pm.response.json();",
+                  "  if (json.access_token) {",
+                  "    pm.collectionVariables.set('token', json.access_token);",
+                  "    pm.test('JWT saved to collection variable', function () {",
+                  "      pm.expect(json.token_type).to.eql('bearer');",
+                  "    });",
+                  "  } else {",
+                  "    console.log('No access_token in response. Body:', JSON.stringify(json));",
+                  "  ",
+                  "} catch (e) {",
+                  "  console.log('Could not parse response as JSON:', e.message);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Analysis (JWT-protected)",
+      "item": [
+        {
+          "name": "Analyze repository",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "CodeKnow JWT from the GitHub login flow. Uses the {{token}} collection variable."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"repo_url\": \"https://github.com/facebook/react\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/analyze/repo",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "analyze", "repo"]
+            },
+            "description": "Analyze a GitHub repository's contributor map and bus factor. Requires a valid Bearer JWT.\n\nAccepts repo_url in either form:\n- https://github.com/owner/repo\n- owner/repo\n\nNote: fetches up to 500 recent commits by default and concurrently pulls each commit's detail — large repos may take a few seconds. Only github.com is supported today."
+          },
+          "response": [
+            {
+              "name": "Success (200)",
+              "originalRequest": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"repo_url\":\"owner/repo\"}" }, "url": { "path": ["{{prefix}}", "analyze", "repo"] } },
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"repo\": \"owner/repo\",\n  \"analyzed_at\": \"2026-06-30T10:00:00+00:00\",\n  \"files\": [\n    {\n      \"path\": \"src/payment/reconciliation.py\",\n      \"contributors\": [\n        { \"author\": \"ravi\", \"commits\": 43, \"last_commit\": \"2024-11-02\", \"ownership_pct\": 84 }\n      ],\n      \"total_commits\": 51,\n      \"bus_factor\": 1\n    }\n  ]\n}"
+            },
+            {
+              "name": "Unauthorized (401)",
+              "_postman_previewlanguage": "json",
+              "code": 401,
+              "status": "Unauthorized",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"detail\": \"Missing or invalid Authorization header\"\n}"
+            },
+            {
+              "name": "Bad URL (400)",
+              "_postman_previewlanguage": "json",
+              "code": 400,
+              "status": "Bad Request",
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"detail\": \"Only github.com repositories are supported at this time. Provide a URL like https://github.com/owner/repo.\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

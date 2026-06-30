@@ -1,6 +1,8 @@
 # CodeKnow — API Reference
 
-Base URL (local): `http://localhost:8000`
+Base URL (local): `http://localhost:8080`
+
+All endpoints are mounted under the `/codeknow` prefix.
 
 ## Health
 
@@ -13,30 +15,54 @@ Response:
 
 ## Auth (GitHub OAuth)
 
-### `GET /auth/github`
+The login flow issues CodeKnow's own JWT (HS256, 7-day expiry). Send it as a
+Bearer token on protected routes.
 
-Starts the OAuth flow. Returns the GitHub authorization URL.
+### `GET /codeknow/auth/github/login`
 
-Response:
+Redirects (307) to GitHub's OAuth consent screen with a signed `state` for CSRF
+protection. Scopes requested: `repo`.
+
+### `GET /codeknow/auth/github/callback?code=...&state=...`
+
+Handles the OAuth callback. Verifies the signed state, exchanges the code for a
+GitHub access token, fetches the GitHub user profile, upserts a `users` row
+(storing the token encrypted), and mints a JWT.
+
+Delivery is controlled by the `FRONTEND_REDIRECT` env var:
+
+- **If set** — redirects (307) to that URL with `?token=<jwt>` appended.
+- **If unset** — returns JSON:
+
 ```json
-{ "authorization_url": "https://github.com/login/oauth/authorize?...", "state": "..." }
+{
+  "access_token": "<jwt>",
+  "token_type": "bearer",
+  "user": { "id": "...", "name": "...", "email": "...", "github_id": 123 }
+}
 ```
 
-### `GET /auth/github/callback?code=...&state=...`
-
-Handles the OAuth callback. Exchanges the code for a token and mints a JWT.
+> **Local dev note:** register `http://localhost:8080/codeknow/auth/github/callback` as
+> the Authorization callback URL in your GitHub OAuth App settings.
 
 ## Analysis
 
-### `POST /analyze/repo`
+### `POST /codeknow/analyze/repo`
+
+**Protected** — requires `Authorization: Bearer <jwt>`.
 
 Body:
 ```json
-{ "repo_url": "owner/repo" }
+{ "repo_url": "https://github.com/owner/repo" }
 ```
 
-`repo_url` accepts either the short `owner/repo` form or a full GitHub URL
-(`https://github.com/owner/repo`).
+`repo_url` accepts either the short `owner/repo` form or a full `github.com`
+URL. Only `github.com` is supported today (GitLab is planned).
+
+The endpoint fetches the most recent commits (default 500, configurable via
+`MAX_COMMITS_TO_ANALYZE`), then concurrently fetches each commit's detail to get
+its `files` array. Per-file contributor stats are aggregated from real file
+attribution. The result is persisted to `repo_analyses`.
 
 Response:
 ```json
@@ -59,5 +85,15 @@ Response:
 ### Field notes
 
 - `ownership_pct`: share of that file's commits attributed to the author.
-- `bus_factor`: how many top contributors account for >50% of commits.
+- `bus_factor`: how many top contributors account for >50% of commits to that file.
 - `last_commit`: ISO date of the author's most recent commit to that file.
+
+### Error responses
+
+| Status | Meaning |
+|---|---|
+| 400 | Invalid `repo_url` (not github.com, or malformed) |
+| 401 | Missing/invalid/expired JWT |
+| 404 | Repository not found |
+| 403 | GitHub token lacks scope or is rate-limited |
+| 502 | GitHub API unreachable or token exchange failed |

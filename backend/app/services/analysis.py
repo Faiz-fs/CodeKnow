@@ -1,4 +1,8 @@
-"""Core analysis: file -> contributor map, bus factor, ownership %."""
+"""Core analysis: file -> contributor map, bus factor, ownership %.
+
+Consumes commits enriched with a `files` list (from the per-commit detail
+endpoint). Each commit is attributed to every file in its `files[].filename`.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ BUS_FACTOR_DOMINANCE_THRESHOLD = 0.50
 
 def _resolve_author(commit: dict) -> str:
     """Prefer the GitHub login, fall back to the git commit author metadata."""
-    author = (commit.get("author") or {})  # GitHub user (nullable)
+    author = commit.get("author") or {}  # GitHub user (nullable)
     if author.get("login"):
         return author["login"]
     commit_meta = commit.get("commit") or {}
@@ -23,55 +27,39 @@ def _resolve_author(commit: dict) -> str:
 
 
 def _last_touched(commit: dict) -> str:
-    """Return an ISO date string from a commit's author date."""
+    """Return an ISO timestamp string from a commit's author date."""
     commit_meta = commit.get("commit") or {}
-    # Prefer the git author date; fall back to committer date.
     return (commit_meta.get("author", {}).get("date")
             or commit_meta.get("committer", {}).get("date")
             or "1970-01-01T00:00:00Z")
 
 
 def build_contributor_map(commits: list[dict]) -> list[FileAnalysis]:
-    """Aggregate raw commits into per-file contributor stats.
+    """Aggregate commits (each carrying a `files` list) into per-file stats.
 
-    GitHub's commits endpoint returns file metadata per commit only with the
-    detailed view; our base endpoint returns one entry per commit (not per
-    file). For the MVP we treat each commit as a unit and attribute it to the
-    tracked paths the caller provides via `files_per_commit`. To keep the
-    first sprint simple and dependency-light, this aggregates at the commit
-    level and emits one FileAnalysis per commit's "primary" path when file
-    data is unavailable.
-
-    NOTE: Sprint 1 baseline uses per-commit author aggregation keyed to a
-    synthetic single-file repo shape. File-level granularity is filled in
-    Sprint 2 once we pull commit-detail (file list) per SHA.
+    A single commit touching multiple files contributes to each of those files'
+    contributor counts. Falls back to synthetic per-commit bucketing only when a
+    commit carries no `files` data.
     """
-    # Group commits by a path key. For the baseline we bucket everything under
-    # a representative sample by author to produce the contributor map shape
-    # the API contract requires. Real file bucketing is layered in Sprint 2.
     by_path: dict[str, list[dict]] = defaultdict(list)
-    # Placeholder bucketing: synthesize per-commit attribution to a single path
-    # derived from the commit message / sha so the response shape is valid.
-    for c in commits:
-        path = _derive_path(c)
-        by_path[path].append(c)
 
-    results: list[FileAnalysis] = []
-    for path, path_commits in by_path.items():
-        results.append(_analyze_file(path, path_commits))
-    return results
+    for commit in commits:
+        files = commit.get("files") or []
+        if files:
+            for f in files:
+                path = (f.get("filename") or f.get("previous_filename")
+                        or "unknown")
+                by_path[path].append(commit)
+        else:
+            # No file data available — bucket under a synthetic path so the
+            # response shape stays valid.
+            by_path[_synthetic_path(commit)].append(commit)
+
+    return [_analyze_file(path, path_commits)
+            for path, path_commits in by_path.items()]
 
 
-def _derive_path(commit: dict) -> str:
-    """Best-effort path label for baseline aggregation.
-
-    If the commit carries file metadata (`files`), use the first filename.
-    Otherwise synthesize a stable placeholder so the response shape is valid
-    and the API is testable. Sprint 2 replaces this with real per-file data.
-    """
-    files = commit.get("files") or []
-    if files:
-        return files[0].get("filename") or "unknown"
+def _synthetic_path(commit: dict) -> str:
     sha = (commit.get("sha") or "")[:7]
     return f"commit-{sha}"
 

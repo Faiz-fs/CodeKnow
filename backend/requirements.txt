@@ -1,11 +1,19 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-httpx==0.27.2
-python-dotenv==1.0.1
-pydantic==2.9.2
-pydantic-settings==2.5.2
-supabase==2.7.4
-PyJWT==2.9.0
-cryptography==43.0.1
-requests-oauthlib==2.0.0
-resend==2.4.0
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
+pydantic-settings
+
+# Database (local Postgres; swap URL for Supabase later — no code change)
+sqlalchemy
+asyncpg
+alembic
+
+# Auth / security
+python-jose[cryptography]
+itsdangerous
+cryptography
+
+# OAuth
+requests-oauthlib

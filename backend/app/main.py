@@ -1,6 +1,6 @@
 """CodeKnow FastAPI application entrypoint."""
 
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
@@ -22,9 +22,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(health.router)
-app.include_router(auth.router, prefix="/auth")
-app.include_router(analyze.router, prefix="/analyze")
+API_PREFIX = "/codeknow"
+
+api_route = APIRouter(prefix=API_PREFIX)
+api_route.include_router(health.router)
+api_route.include_router(auth.router, prefix="/auth")
+api_route.include_router(analyze.router, prefix="/analyze")
+
+app.include_router(api_route)
 
 
 @app.get("/")

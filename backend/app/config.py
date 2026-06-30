@@ -1,28 +1,40 @@
 """Application configuration loaded from environment variables."""
 
 from functools import lru_cache
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # --- App ---
     app_env: str = "development"
-    app_port: int = 8000
+    app_port: int = 8080
     app_cors_origins: str = "http://localhost:5173"
 
+    # --- Database (local Postgres for now; swap URL for Supabase later) ---
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/codeknow_db"
+
+    # --- GitHub OAuth ---
+    # Create an OAuth app at https://github.com/settings/developers
+    # Authorization callback URL: http://localhost:8000/auth/github/callback
     github_client_id: str = ""
     github_client_secret: str = ""
-    github_oauth_redirect_uri: str = "http://localhost:8000/auth/github/callback"
+    github_redirect_uri: str = "http://localhost:8080/codeknow/auth/github/callback"
 
-    supabase_url: str = ""
-    supabase_service_role_key: str = ""
+    # --- Frontend redirect after OAuth (optional) ---
+    # If set, callback redirects here with ?token=<jwt>. If unset, returns JSON.
+    frontend_redirect: str = ""
 
-    resend_api_key: str = ""
-    alert_from_email: str = "alerts@codeknow.dev"
-
+    # --- Security ---
     jwt_secret: str = "dev-insecure-secret-change-me"
+    # Fernet key for encrypting stored GitHub tokens. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    encryption_key: str = ""
+
+    # --- Analysis tuning ---
+    max_commits_to_analyze: int = 500
+    github_concurrent_requests: int = 10
 
     @property
     def cors_origins(self) -> list[str]:

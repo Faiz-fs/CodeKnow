@@ -8,9 +8,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       // Proxy API calls to the FastAPI backend during development.
-      '/analyze': 'http://localhost:8000',
-      '/auth': 'http://localhost:8000',
-      '/health': 'http://localhost:8000',
+      // All backend endpoints live under the /codeknow prefix on port 8080.
+      '/codeknow': 'http://localhost:8080',
     },
   },
 })
