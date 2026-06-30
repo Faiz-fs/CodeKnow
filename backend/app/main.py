@@ -4,7 +4,7 @@ from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import analyze, auth, health
+from app.routers import analyze, auth, github, health
 
 settings = get_settings()
 
@@ -28,6 +28,7 @@ api_route = APIRouter(prefix=API_PREFIX)
 api_route.include_router(health.router)
 api_route.include_router(auth.router, prefix="/auth")
 api_route.include_router(analyze.router, prefix="/analyze")
+api_route.include_router(github.router, prefix="/github")
 
 app.include_router(api_route)
 

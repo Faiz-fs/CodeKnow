@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     max_commits_to_analyze: int = 500
     github_concurrent_requests: int = 10
 
+    # --- Repo listing (GET /repos) ---
+    max_repos_to_fetch: int = 200  # caps total repos pulled from GitHub's /user/repos
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.app_cors_origins.split(",") if o.strip()]
