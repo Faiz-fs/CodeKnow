@@ -1,0 +1,10 @@
+# Local env & secrets — keep everything in the root .gitignore too, but be explicit
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
