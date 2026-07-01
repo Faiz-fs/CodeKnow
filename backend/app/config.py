@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     max_commits_to_analyze: int = 500
     github_concurrent_requests: int = 10
 
+    # --- Decay detection thresholds ---
+    decay_warning_days: int = 60
+    decay_critical_days: int = 90
+    decay_warning_commits: int = 1
+    decay_critical_commits: int = 3
+    decay_critical_change_pct: float = 30.0
+
     # --- Repo listing (GET /repos) ---
     max_repos_to_fetch: int = 200  # caps total repos pulled from GitHub's /user/repos
 
