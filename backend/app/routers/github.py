@@ -12,10 +12,11 @@ import re
 from collections.abc import AsyncGenerator
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from app import auth
 from app.config import get_settings
+from app.core.errors import AuthError, GitHubAPIError, TokenDecryptionError
 from app.core.security import decrypt_token
 from app.models.github import RepoListResponse, UserRepo
 from app.models.user import User
@@ -64,13 +65,11 @@ async def _iter_user_repos(token: str) -> AsyncGenerator[dict, None]:
             resp = await client.get(next_url, headers=headers)
 
             if resp.status_code == 401:
-                raise HTTPException(
-                    401,
+                raise AuthError(
                     "GitHub token expired or revoked. Please sign in again.",
                 )
             if resp.status_code == 403:
-                raise HTTPException(
-                    403,
+                raise GitHubAPIError(
                     "GitHub API forbidden — token may lack the `repo` scope or be "
                     "rate-limited.",
                 )
@@ -78,8 +77,7 @@ async def _iter_user_repos(token: str) -> AsyncGenerator[dict, None]:
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
-                raise HTTPException(
-                    502,
+                raise GitHubAPIError(
                     f"GitHub API error ({resp.status_code}): {e}",
                 ) from e
 
@@ -100,15 +98,14 @@ async def _iter_user_repos(token: str) -> AsyncGenerator[dict, None]:
 async def list_repos(user: User = Depends(auth.get_current_user)):
     """Return the authenticated user's repositories (most-recently-updated first)."""
     if not user.github_access_token_encrypted:
-        raise HTTPException(
-            401,
+        raise AuthError(
             "No GitHub account connected. Please sign in with GitHub first.",
         )
 
     try:
         token = decrypt_token(user.github_access_token_encrypted)
     except ValueError as e:
-        raise HTTPException(500, f"Failed to decrypt stored token: {e}") from e
+        raise TokenDecryptionError(f"Failed to decrypt stored token: {e}") from e
 
     repos: list[UserRepo] = []
     try:
@@ -123,9 +120,9 @@ async def list_repos(user: User = Depends(auth.get_current_user)):
                     default_branch=repo.get("default_branch") or "main",
                 )
             )
-    except HTTPException:
+    except (AuthError, GitHubAPIError):
         raise
     except Exception as e:
-        raise HTTPException(502, f"Failed to fetch repos from GitHub: {e}") from e
+        raise GitHubAPIError(f"Failed to fetch repos from GitHub: {e}") from e
 
     return RepoListResponse(repos=repos)

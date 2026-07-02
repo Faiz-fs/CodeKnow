@@ -1,9 +1,11 @@
 """CodeKnow FastAPI application entrypoint."""
 
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import get_settings
+from app.core.errors import CodeKnowException
 from app.routers import analyze, auth, github, health
 
 settings = get_settings()
@@ -13,6 +15,21 @@ app = FastAPI(
     description="Codebase intelligence & knowledge-retention platform.",
     version="0.1.0",
 )
+
+# Register global exception handler for CodeKnowException
+@app.exception_handler(CodeKnowException)
+async def codeknow_exception_handler(request: Request, exc: CodeKnowException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.detail,
+                "status": exc.status_code,
+            }
+        },
+        headers=exc.headers,
+    )
 
 app.add_middleware(
     CORSMiddleware,

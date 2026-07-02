@@ -8,22 +8,44 @@ contributor map + bus factor, persists the result, and returns it.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
+from app.core.errors import (
+    GitHubAPIError,
+    InvalidRepoURLError,
+    RepoNotFoundError,
+    TokenDecryptionError,
+)
 from app.core.security import decrypt_token
 from app.db import get_db
-from app.models.analysis import AnalyzeRequest, RepoAnalysisResponse
+from app.models.analysis import RepoAnalysisResponse, AnalyzeRequest
 from app.models.repo_analysis import RepoAnalysis
 from app.models.user import User
 from app.services import analysis, github
 from pydantic import BaseModel
 
 router = APIRouter()
+
+class AtRiskFile(BaseModel):
+    path: str
+    decay_status: str
+    owner: str
+    days_since_owner_touched: int
+    commits_since_owner_left: int
+    pct_changed_since_owner_left: float
+
+
+class AtRiskResponse(BaseModel):
+    repo: str
+    analyzed_at: str
+    total_at_risk: int
+    files: list[AtRiskFile]
 
 
 def _parse_repo(repo_url: str) -> tuple[str, str]:
@@ -33,15 +55,14 @@ def _parse_repo(repo_url: str) -> tuple[str, str]:
     """
     repo_url = repo_url.strip().rstrip("/")
     if "github.com" not in repo_url:
-        raise HTTPException(
-            400,
+        raise InvalidRepoURLError(
             "Only github.com repositories are supported at this time. "
-            "Provide a URL like https://github.com/owner/repo.",
+            "Provide a URL like https://github.com/owner/repo."
         )
     repo_url = repo_url.split("github.com/", 1)[-1].removesuffix(".git")
     parts = repo_url.split("/")
     if len(parts) != 2 or not all(parts):
-        raise HTTPException(400, "repo_url must be 'owner/repo' or a github.com URL")
+        raise InvalidRepoURLError("repo_url must be 'owner/repo' or a github.com URL")
     return parts[0], parts[1]
 
 
@@ -55,11 +76,11 @@ async def analyze_repo(
 
     # Decrypt the user's stored GitHub token for authenticated API calls.
     if not user.github_access_token_encrypted:
-        raise HTTPException(400, "No GitHub token stored for this user")
+        raise TokenDecryptionError("No GitHub token stored for this user")
     try:
         token = decrypt_token(user.github_access_token_encrypted)
     except ValueError as e:
-        raise HTTPException(500, f"Failed to decrypt stored token: {e}") from e
+        raise TokenDecryptionError(f"Failed to decrypt stored token: {e}") from e
 
     client = github.GitHubClient(token=token)
     try:
@@ -67,15 +88,14 @@ async def analyze_repo(
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
         if status == 404:
-            raise HTTPException(404, f"Repository {owner}/{repo} not found")
+            raise GitHubAPIError(f"Repository {owner}/{repo} not found")
         if status == 403:
-            raise HTTPException(
-                403,
+            raise GitHubAPIError(
                 "GitHub API forbidden — token may lack scope or be rate-limited",
             )
-        raise HTTPException(502, f"GitHub API error ({status}): {e}") from e
+        raise GitHubAPIError(f"GitHub API error ({status}): {e}") from e
     except httpx.HTTPError as e:
-        raise HTTPException(502, f"GitHub API error: {e}") from e
+        raise GitHubAPIError(f"GitHub API error: {e}") from e
     finally:
         await client.close()
 
@@ -100,21 +120,6 @@ async def analyze_repo(
     return response
 
 
-class AtRiskFile(BaseModel):
-    path: str
-    decay_status: str
-    owner: str
-    days_since_owner_touched: int
-    commits_since_owner_left: int
-    pct_changed_since_owner_left: float
-
-
-class AtRiskResponse(BaseModel):
-    repo: str
-    analyzed_at: str
-    total_at_risk: int
-    files: list[AtRiskFile]
-
 
 @router.get("/repo/at-risk", response_model=AtRiskResponse)
 async def get_at_risk_files(
@@ -127,10 +132,9 @@ async def get_at_risk_files(
     Pulls from stored analysis. Returns 404 if no analysis exists yet.
     """
     if "/" not in repo_full_name:
-        raise HTTPException(400, "repo_full_name must be in 'owner/repo' format")
+        raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
 
-    # FIX: use scalars().first() instead of scalar_one_or_none()
-    # to safely handle multiple stored rows for the same repo
+    # Use scalars().first() to safely handle multiple stored rows for the same repo
     result = await db.execute(
         select(RepoAnalysis)
         .where(RepoAnalysis.repo_full_name == repo_full_name)
@@ -141,10 +145,9 @@ async def get_at_risk_files(
     analysis_row = result.scalars().first()
 
     if analysis_row is None:
-        raise HTTPException(
-            404,
+        raise RepoNotFoundError(
             f"No analysis found for {repo_full_name}. "
-            "Run POST /codeknow/analyze/repo first.",
+            "Run POST /codeknow/analyze/repo first."
         )
 
     raw = analysis_row.raw_result or {}
@@ -173,4 +176,283 @@ async def get_at_risk_files(
         analyzed_at=analysis_row.analyzed_at.isoformat(),
         total_at_risk=len(at_risk_files),
         files=at_risk_files,
+    )
+
+
+# --- History endpoint ---
+
+class AnalysisHistoryItem(BaseModel):
+    repo_full_name: str
+    platform: str
+    analyzed_at: str
+    total_files: int
+    total_at_risk: int
+    critical_count: int
+    decaying_count: int
+    bus_factor_1_count: int
+
+
+class AnalysisHistoryResponse(BaseModel):
+    analyses: list[AnalysisHistoryItem]
+
+
+def _compute_history_metrics(files_data: list[dict]) -> tuple[int, int, int, int, int]:
+    """Derive metrics from raw file analysis data.
+
+    Returns: (total_files, total_at_risk, critical_count, decaying_count, bus_factor_1_count)
+    """
+    total_files = len(files_data)
+    critical_count = 0
+    decaying_count = 0
+    bus_factor_1_count = 0
+    total_at_risk = 0
+
+    for f in files_data:
+        decay = f.get("decay")
+        if decay:
+            status = decay.get("status")
+            if status == "critical":
+                critical_count += 1
+                total_at_risk += 1
+            elif status == "decaying":
+                decaying_count += 1
+                total_at_risk += 1
+        bus_factor = f.get("bus_factor", 0) or 0
+        if bus_factor == 1:
+            bus_factor_1_count += 1
+
+    return total_files, total_at_risk, critical_count, decaying_count, bus_factor_1_count
+
+
+@router.get("/repo/history", response_model=AnalysisHistoryResponse)
+async def get_analysis_history(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all repos the current user has analyzed, most recent first.
+    Shows only the latest analysis per repo.
+    """
+    # Get distinct repos with their latest analysis timestamp
+    result = await db.execute(
+        select(
+            RepoAnalysis.repo_full_name,
+            RepoAnalysis.platform,
+            RepoAnalysis.analyzed_at,
+            RepoAnalysis.raw_result,
+        )
+        .where(RepoAnalysis.user_id == str(user.id))
+        .order_by(RepoAnalysis.analyzed_at.desc())
+    )
+    rows = result.fetchall()
+
+    # Group by repo_full_name, keeping only the most recent
+    seen_repos: dict[str, AnalysisHistoryItem] = {}
+    for row in rows:
+        repo_name = row.repo_full_name
+        if repo_name in seen_repos:
+            # Keep only the first (most recent) entry per repo
+            continue
+
+        files_data = (row.raw_result or {}).get("files", [])
+        total_files, total_at_risk, critical_count, decaying_count, bus_factor_1_count = (
+            _compute_history_metrics(files_data)
+        )
+
+        seen_repos[repo_name] = AnalysisHistoryItem(
+            repo_full_name=repo_name,
+            platform=row.platform,
+            analyzed_at=row.analyzed_at.isoformat(),
+            total_files=total_files,
+            total_at_risk=total_at_risk,
+            critical_count=critical_count,
+            decaying_count=decaying_count,
+            bus_factor_1_count=bus_factor_1_count,
+        )
+
+    return AnalysisHistoryResponse(analyses=list(seen_repos.values()))
+
+
+# --- Full result endpoint ---
+
+@router.get("/repo/result", response_model=RepoAnalysisResponse)
+async def get_stored_result(
+    repo_full_name: str = Query(..., description="Repository in owner/repo format"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch the full stored analysis for a repo without re-hitting GitHub."""
+    decoded_repo = unquote(repo_full_name)
+
+    if "/" not in decoded_repo:
+        raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
+
+    result = await db.execute(
+        select(RepoAnalysis)
+        .where(RepoAnalysis.repo_full_name == decoded_repo)
+        .where(RepoAnalysis.user_id == str(user.id))
+        .order_by(RepoAnalysis.analyzed_at.desc())
+        .limit(1)
+    )
+    analysis_row = result.scalars().first()
+
+    if analysis_row is None:
+        raise RepoNotFoundError(
+            f"No analysis found for {decoded_repo}. "
+            "Run POST /codeknow/analyze/repo first."
+        )
+
+    raw = analysis_row.raw_result or {}
+    return RepoAnalysisResponse(
+        repo=decoded_repo,
+        analyzed_at=analysis_row.analyzed_at.isoformat(),
+        files=raw.get("files", []),
+    )
+
+
+# --- Modules endpoint ---
+
+class ModuleInfo(BaseModel):
+    module_name: str
+    total_files: int
+    bus_factor_min: int
+    bus_factor_avg: float
+    critical_files: int
+    decaying_files: int
+    stable_files: int
+    risk_level: str
+    top_owners: list[str]
+
+
+class ModulesResponse(BaseModel):
+    repo: str
+    analyzed_at: str
+    modules: list[ModuleInfo]
+
+
+def _get_module_name(file_path: str) -> str:
+    """Extract top-level folder (module) from a file path."""
+    if "/" not in file_path:
+        return "(root)"
+    return file_path.split("/", 1)[0]
+
+
+def _compute_modules(files_data: list[dict]) -> list[ModuleInfo]:
+    """Roll up file-level data to module level."""
+    modules: dict[str, dict] = {}
+
+    for f in files_data:
+        file_path = f.get("path", "")
+        module_name = _get_module_name(file_path)
+
+        if module_name not in modules:
+            modules[module_name] = {
+                "files": [],
+                "bus_factors": [],
+                "owners": [],  # Will collect (owner, ownership_pct) pairs
+            }
+
+        modules[module_name]["files"].append(f)
+        modules[module_name]["bus_factors"].append(f.get("bus_factor", 0) or 0)
+
+        # Collect top contributors for top_owners
+        for contrib in f.get("contributors", []):
+            owner = contrib.get("author", "")
+            pct = contrib.get("ownership_pct", 0) or 0
+            modules[module_name]["owners"].append((owner, pct))
+
+    result = []
+    for module_name, data in modules.items():
+        files = data["files"]
+        bus_factors = data["bus_factors"]
+
+        # Find critical/decaying/stable counts
+        critical_files = sum(
+            1 for f in files
+            if (f.get("decay") or {}).get("status") == "critical"
+        )
+        decaying_files = sum(
+            1 for f in files
+            if (f.get("decay") or {}).get("status") == "decaying"
+        )
+        stable_files = len(files) - critical_files - decaying_files
+
+        bus_factor_min = min(bus_factors) if bus_factors else 0
+        bus_factor_avg = round(sum(bus_factors) / len(bus_factors), 1) if bus_factors else 0.0
+
+        # Determine risk_level
+        if bus_factor_min == 1 or critical_files > 0:
+            risk_level = "critical"
+        elif bus_factor_avg < 2 or decaying_files > 0:
+            risk_level = "warning"
+        else:
+            risk_level = "healthy"
+
+        # Get top 3 unique owners by ownership_pct
+        # Sort by ownership_pct descending, then deduplicate by author
+        sorted_owners = sorted(
+            data["owners"],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        seen_owners = set()
+        top_owners = []
+        for owner, pct in sorted_owners:
+            if owner not in seen_owners and len(top_owners) < 3:
+                top_owners.append(owner)
+                seen_owners.add(owner)
+
+        result.append(ModuleInfo(
+            module_name=module_name,
+            total_files=len(files),
+            bus_factor_min=bus_factor_min,
+            bus_factor_avg=bus_factor_avg,
+            critical_files=critical_files,
+            decaying_files=decaying_files,
+            stable_files=stable_files,
+            risk_level=risk_level,
+            top_owners=top_owners,
+        ))
+
+    # Sort by risk_level (critical first, then warning, then healthy),
+    # then by critical_files descending within each tier
+    risk_order = {"critical": 0, "warning": 1, "healthy": 2}
+    result.sort(key=lambda x: (risk_order.get(x.risk_level, 3), -x.critical_files))
+
+    return result
+
+
+@router.get("/repo/modules", response_model=ModulesResponse)
+async def get_modules(
+    repo_full_name: str = Query(..., description="Repository in owner/repo format"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Module-level aggregation — rolls up file-level data to folder level."""
+    decoded_repo = unquote(repo_full_name)
+
+    if "/" not in decoded_repo:
+        raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
+
+    result = await db.execute(
+        select(RepoAnalysis)
+        .where(RepoAnalysis.repo_full_name == decoded_repo)
+        .where(RepoAnalysis.user_id == str(user.id))
+        .order_by(RepoAnalysis.analyzed_at.desc())
+        .limit(1)
+    )
+    analysis_row = result.scalars().first()
+
+    if analysis_row is None:
+        raise RepoNotFoundError(
+            f"No analysis found for {decoded_repo}. "
+            "Run POST /codeknow/analyze/repo first."
+        )
+
+    raw = analysis_row.raw_result or {}
+    files_data = raw.get("files", [])
+
+    return ModulesResponse(
+        repo=decoded_repo,
+        analyzed_at=analysis_row.analyzed_at.isoformat(),
+        modules=_compute_modules(files_data),
     )

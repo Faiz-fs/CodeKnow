@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import AuthError
 from app.core.security import decode_jwt
 from app.db import get_db
 from app.models.user import User
@@ -24,27 +25,21 @@ async def get_current_user(
     user no longer exists.
     """
     if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
+        raise AuthError(
             "Missing or invalid Authorization header",
-            headers={"WWW-Authenticate": "Bearer"},
         )
 
     try:
         user_id = decode_jwt(credentials.credentials)
     except ValueError as e:
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
+        raise AuthError(
             str(e),
-            headers={"WWW-Authenticate": "Bearer"},
         ) from e
 
     result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
+    user = result.scalars().first()
     if user is None:
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
+        raise AuthError(
             "User not found",
-            headers={"WWW-Authenticate": "Bearer"},
         )
     return user

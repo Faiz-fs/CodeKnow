@@ -27,6 +27,20 @@
             "description": "Liveness check. Returns { \"status\": \"ok\" }."
           },
           "response": []
+        },
+        {
+          "name": "Detailed health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/health/detailed",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "health", "detailed"]
+            },
+            "description": "Detailed health check with dependency verification. Not authenticated. Returns database and GitHub OAuth status."
+          },
+          "response": []
         }
       ]
     },
@@ -128,22 +142,131 @@
               "body": "{\n  \"repo\": \"owner/repo\",\n  \"analyzed_at\": \"2026-06-30T10:00:00+00:00\",\n  \"files\": [\n    {\n      \"path\": \"src/payment/reconciliation.py\",\n      \"contributors\": [\n        { \"author\": \"ravi\", \"commits\": 43, \"last_commit\": \"2024-11-02\", \"ownership_pct\": 84 }\n      ],\n      \"total_commits\": 51,\n      \"bus_factor\": 1\n    }\n  ]\n}"
             },
             {
-              "name": "Unauthorized (401)",
+              "name": "Error response format (standardized)",
               "_postman_previewlanguage": "json",
               "code": 401,
               "status": "Unauthorized",
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"detail\": \"Missing or invalid Authorization header\"\n}"
-            },
-            {
-              "name": "Bad URL (400)",
-              "_postman_previewlanguage": "json",
-              "code": 400,
-              "status": "Bad Request",
-              "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"detail\": \"Only github.com repositories are supported at this time. Provide a URL like https://github.com/owner/repo.\"\n}"
+              "body": "{\n  \"error\": {\n    \"code\": \"AUTH_ERROR\",\n    \"message\": \"Missing or invalid Authorization header\",\n    \"status\": 401\n  }\n}"
             }
           ]
+        }
+      ]
+    },
+    {
+      "name": "Retrieve Analysis (JWT-protected)",
+      "item": [
+        {
+          "name": "Get analysis history",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "CodeKnow JWT from the GitHub login flow."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/analyze/repo/history",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "analyze", "repo", "history"]
+            },
+            "description": "Returns all repos the current user has analyzed, most recent first. Shows only the latest analysis per repo."
+          },
+          "response": []
+        },
+        {
+          "name": "Get stored analysis result",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "CodeKnow JWT from the GitHub login flow."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/analyze/repo/encode%2Fhttpx/result",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "analyze", "repo", "encode%2Fhttpx", "result"]
+            },
+            "description": "Fetch the full stored analysis for a repo without re-hitting GitHub. Use URL-encoded repo names (e.g., encode%2Fhttpx for encode/httpx)."
+          },
+          "response": []
+        },
+        {
+          "name": "Get module-level aggregation",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "CodeKnow JWT from the GitHub login flow."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/analyze/repo/encode%2Fhttpx/modules",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "analyze", "repo", "encode%2Fhttpx", "modules"]
+            },
+            "description": "Module-level aggregation rolls up file-level data to folder level. Returns modules sorted by risk_level (critical first)."
+          },
+          "response": []
+        },
+        {
+          "name": "Get at-risk files",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "CodeKnow JWT from the GitHub login flow."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/analyze/repo/at-risk?repo_full_name=encode%2Fhttpx",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "analyze", "repo", "at-risk"],
+              "query": [
+                {
+                  "key": "repo_full_name",
+                  "value": "encode/httpx",
+                  "description": "Repository in owner/repo format"
+                }
+              ]
+            },
+            "description": "Returns files with decay status 'decaying' or 'critical' from stored analysis."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "GitHub Integration (JWT-protected)",
+      "item": [
+        {
+          "name": "List repositories",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "description": "CodeKnow JWT from the GitHub login flow."
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}{{prefix}}/github/repos",
+              "host": ["{{baseUrl}}"],
+              "path": ["{{prefix}}", "github", "repos"]
+            },
+            "description": "Returns the authenticated user's repositories (most-recently-updated first)."
+          },
+          "response": []
         }
       ]
     }

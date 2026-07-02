@@ -6,11 +6,13 @@ GET /codeknow/auth/github/callback  -> verify state, exchange code, upsert user,
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
+from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.errors import GitHubAPIError, AuthError
 from app.core.security import (
     create_jwt,
     encrypt_token,
@@ -31,7 +33,7 @@ GITHUB_AUTH_URL = "https://github.com/login/oauth/authorize"
 def github_login():
     """Redirect the browser to GitHub's OAuth consent screen."""
     if not settings.github_client_id:
-        raise HTTPException(500, "GitHub OAuth client ID not configured")
+        raise AuthError("GitHub OAuth client ID not configured")
 
     state = sign_state()
     params = {
@@ -42,8 +44,6 @@ def github_login():
     }
     query = "&".join(f"{k}={v}" for k, v in params.items())
     authorization_url = f"{GITHUB_AUTH_URL}?{query}"
-
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url=authorization_url, status_code=307)
 
 
@@ -55,22 +55,22 @@ async def github_callback(code: str, state: str, db: AsyncSession = Depends(get_
     try:
         verify_state(state)
     except ValueError as e:
-        raise HTTPException(400, f"OAuth state error: {e}") from e
+        raise AuthError(f"OAuth state error: {e}") from e
 
     if not code:
-        raise HTTPException(400, "Missing authorization code")
+        raise AuthError("Missing authorization code")
 
     # 2. Exchange code for a GitHub access token
     try:
         access_token = github.exchange_code_for_token(code)
     except (ValueError, Exception) as e:
-        raise HTTPException(502, f"GitHub token exchange failed: {e}") from e
+        raise GitHubAPIError(f"GitHub token exchange failed: {e}") from e
 
     # 3. Fetch the GitHub user profile
     try:
         profile = github.fetch_user_profile(access_token)
     except Exception as e:
-        raise HTTPException(502, f"GitHub profile fetch failed: {e}") from e
+        raise GitHubAPIError(f"GitHub profile fetch failed: {e}") from e
 
     github_id = profile.get("id")
     login = profile.get("login")
@@ -80,7 +80,7 @@ async def github_callback(code: str, state: str, db: AsyncSession = Depends(get_
     # 4. Upsert the user (encrypt the token before storing)
     encrypted_token = encrypt_token(access_token)
     result = await db.execute(select(User).where(User.github_id == github_id))
-    user = result.scalar_one_or_none()
+    user = result.scalars().first()
 
     if user is None:
         user = User(
@@ -103,7 +103,6 @@ async def github_callback(code: str, state: str, db: AsyncSession = Depends(get_
 
     # 6. Deliver: redirect (browser flow) or JSON (API/testing flow)
     if settings.frontend_redirect:
-        from fastapi.responses import RedirectResponse
         separator = "&" if "?" in settings.frontend_redirect else "?"
         return RedirectResponse(
             url=f"{settings.frontend_redirect}{separator}token={token}",
