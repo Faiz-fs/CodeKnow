@@ -1,8 +1,4 @@
-"""Core analysis: file -> contributor map, bus factor, ownership %, decay detection.
-
-Consumes commits enriched with a `files` list (from the per-commit detail
-endpoint). Each commit is attributed to every file in its `files[].filename`.
-"""
+"""Core analysis: file -> contributor map, bus factor, ownership %, decay detection."""
 
 from __future__ import annotations
 
@@ -11,15 +7,12 @@ from datetime import date, datetime
 
 from app.config import get_settings
 from app.models.analysis import Contributor, Decay, FileAnalysis
-
-
-# Single-author share above this threshold triggers bus factor = 1.
-BUS_FACTOR_DOMINANCE_THRESHOLD = 0.50
+from app.models.analysis_config import AnalysisConfig
 
 
 def _resolve_author(commit: dict) -> str:
     """Prefer the GitHub login, fall back to the git commit author metadata."""
-    author = commit.get("author") or {}  # GitHub user (nullable)
+    author = commit.get("author") or {}
     if author.get("login"):
         return author["login"]
     commit_meta = commit.get("commit") or {}
@@ -35,13 +28,11 @@ def _last_touched(commit: dict) -> str:
             or "1970-01-01T00:00:00Z")
 
 
-def build_contributor_map(commits: list[dict]) -> list[FileAnalysis]:
-    """Aggregate commits (each carrying a `files` list) into per-file stats.
+def build_contributor_map(commits: list[dict], config: AnalysisConfig | None = None) -> list[FileAnalysis]:
+    """Aggregate commits into per-file stats."""
+    if config is None:
+        config = AnalysisConfig()
 
-    A single commit touching multiple files contributes to each of those files'
-    contributor counts. Falls back to synthetic per-commit bucketing only when a
-    commit carries no `files` data.
-    """
     by_path: dict[str, list[dict]] = defaultdict(list)
 
     for commit in commits:
@@ -52,12 +43,21 @@ def build_contributor_map(commits: list[dict]) -> list[FileAnalysis]:
                         or "unknown")
                 by_path[path].append(commit)
         else:
-            # No file data available — bucket under a synthetic path so the
-            # response shape stays valid.
             by_path[_synthetic_path(commit)].append(commit)
 
-    return [_analyze_file(path, path_commits)
-            for path, path_commits in by_path.items()]
+    all_authors: set[str] = set()
+    for commit in commits:
+        author = _resolve_author(commit)
+        all_authors.add(author)
+
+    total_contributors_across_repo = len(all_authors)
+
+    analyses = []
+    for path, path_commits in by_path.items():
+        analysis = _analyze_file(path, path_commits, config, total_contributors_across_repo)
+        analyses.append(analysis)
+
+    return analyses
 
 
 def _synthetic_path(commit: dict) -> str:
@@ -65,10 +65,13 @@ def _synthetic_path(commit: dict) -> str:
     return f"commit-{sha}"
 
 
-def _analyze_file(path: str, commits: list[dict]) -> FileAnalysis:
-    # Track per-author stats, full timestamps for decay, and all commit dates.
+def _analyze_file(path: str, commits: list[dict], config: AnalysisConfig | None = None, total_contributors_across_repo: int | None = None) -> FileAnalysis:
+    """Analyze a single file."""
+    if config is None:
+        config = AnalysisConfig()
+
     per_author: dict[str, dict] = {}
-    all_commit_dates: list[str] = []  # Track all commit timestamps for decay
+    all_commit_dates: list[str] = []
 
     for c in commits:
         author = _resolve_author(c)
@@ -83,7 +86,6 @@ def _analyze_file(path: str, commits: list[dict]) -> FileAnalysis:
             entry["last_commit_ts"] = date_str
 
     total = sum(e["commits"] for e in per_author.values())
-    # Build per-author data with date-only for response, but retain timestamp for decay.
     per_author_data = []
     for author, e in per_author.items():
         ts = _parse_iso_datetime(e["last_commit_ts"])
@@ -109,37 +111,39 @@ def _analyze_file(path: str, commits: list[dict]) -> FileAnalysis:
         reverse=True,
     )
 
-    # Find owner timestamp for decay calculation.
     owner_ts = None
     for d in per_author_data:
         if d["author"] == contributors[0].author:
             owner_ts = d["last_commit_ts"]
             break
 
-    decay_info = _calculate_decay(contributors, commits, all_commit_dates, owner_ts)
+    decay_info = _calculate_decay(contributors, commits, all_commit_dates, owner_ts, config, total_contributors_across_repo)
     return FileAnalysis(
         path=path,
         contributors=contributors,
         total_commits=total,
-        bus_factor=_bus_factor(contributors, total),
+        bus_factor=_bus_factor(contributors, total, config),
         decay=decay_info,
     )
 
 
-def _bus_factor(contributors: list[Contributor], total: int) -> int:
-    """Bus factor: how many top contributors account for >50% of commits."""
+def _bus_factor(contributors: list[Contributor], total: int, config: AnalysisConfig | None = None) -> int:
+    """Bus factor: how many top contributors account for >threshold% of commits."""
+    if config is None:
+        config = AnalysisConfig()
+
     if total == 0 or not contributors:
         return 0
     cumulative = 0
     for i, c in enumerate(contributors, start=1):
         cumulative += c.ownership_pct
-        if cumulative > (BUS_FACTOR_DOMINANCE_THRESHOLD * 100):
+        if cumulative > (config.bus_factor_threshold * 100):
             return i
     return len(contributors)
 
 
 def _iso_date(iso_ts: str) -> str:
-    """Trim an ISO timestamp down to a date string for the response."""
+    """Trim an ISO timestamp down to a date string."""
     try:
         return date.fromisoformat(iso_ts[:10]).isoformat()
     except (ValueError, TypeError):
@@ -149,7 +153,6 @@ def _iso_date(iso_ts: str) -> str:
 def _parse_iso_datetime(ts: str) -> datetime | None:
     """Parse ISO timestamp string (handles 'Z' suffix for UTC)."""
     try:
-        # Handle ISO format with 'Z' suffix (UTC indicator)
         if ts.endswith('Z'):
             ts = ts[:-1] + '+00:00'
         return datetime.fromisoformat(ts)
@@ -162,23 +165,37 @@ def _calculate_decay(
     commits: list[dict],
     all_commit_dates: list[str],
     owner_last_ts: datetime | None,
+    config: AnalysisConfig | None = None,
+    total_contributors_across_repo: int | None = None,
 ) -> Decay | None:
-    """Calculate decay status for a file based on owner inactivity.
+    """Calculate decay status for a file."""
+    if config is None:
+        config = AnalysisConfig()
 
-    Returns None if there's insufficient data (single contributor only).
-    The owner_last_ts parameter is the pre-parsed datetime of the owner's last commit.
-    """
+    # SOLO-DEVELOPER DETECTION
+    if len(contributors) == 1:
+        if total_contributors_across_repo == 1:
+            owner = contributors[0]
+            return Decay(
+                status="critical",
+                owner=owner.author,
+                owner_last_commit=owner.last_commit,
+                days_since_owner_touched=0,
+                commits_since_owner_left=0,
+                pct_changed_since_owner_left=0.0,
+                solo_developer=True,
+            )
+        else:
+            return None
+
     if not contributors or len(contributors) < 2:
-        # No decay risk if only one contributor — they're still active by definition.
         return None
 
-    settings = get_settings()
     owner = contributors[0]
 
     if owner_last_ts is None:
         return None
 
-    # Find the most recent commit date on this file (by ANY contributor).
     most_recent_ts = None
     for date_str in all_commit_dates:
         ts = _parse_iso_datetime(date_str)
@@ -189,10 +206,8 @@ def _calculate_decay(
     if most_recent_ts is None:
         return None
 
-    # Calculate days since owner's last touch.
     days_since_owner_touched = (most_recent_ts - owner_last_ts).days
 
-    # Count commits by others after the owner's last commit.
     owner_last_date = owner_last_ts.date()
     commits_since_owner_left = 0
     for c in commits:
@@ -208,20 +223,13 @@ def _calculate_decay(
         commits_since_owner_left / total * 100, 2
     ) if total else 0.0
 
-    # Determine decay status based on thresholds.
-    # Order matters: check stable first (covers both conditions), then critical,
-    # then decaying as the default middle state.
-    # stable: owner touched within warning_days OR no commits by others since they left.
-    if days_since_owner_touched <= settings.decay_warning_days or commits_since_owner_left == 0:
+    if days_since_owner_touched <= config.decay_warning_days or commits_since_owner_left == 0:
         status = "stable"
-    # critical: either (critical_days+ days AND critical_commits+ commits) OR
-    #           (critical_change_pct of total commits after owner left).
-    elif (days_since_owner_touched >= settings.decay_critical_days
-          and commits_since_owner_left >= settings.decay_critical_commits):
+    elif (days_since_owner_touched >= config.decay_critical_days
+          and commits_since_owner_left >= config.decay_critical_commits):
         status = "critical"
-    elif pct_changed_since_owner_left >= settings.decay_critical_change_pct:
+    elif pct_changed_since_owner_left >= config.decay_critical_change_pct:
         status = "critical"
-    # decaying: owner hasn't touched in warning_days+ days AND at least warning_commits by others.
     else:
         status = "decaying"
 

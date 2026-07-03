@@ -16,4 +16,3 @@ itsdangerous
 cryptography
 
 # OAuth
-requests-oauthlib

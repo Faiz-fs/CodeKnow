@@ -25,6 +25,7 @@ from app.core.errors import (
 from app.core.security import decrypt_token
 from app.db import get_db
 from app.models.analysis import RepoAnalysisResponse, AnalyzeRequest
+from app.models.analysis_config import AnalysisConfig
 from app.models.repo_analysis import RepoAnalysis
 from app.models.user import User
 from app.services import analysis, github
@@ -69,6 +70,12 @@ def _parse_repo(repo_url: str) -> tuple[str, str]:
 @router.post("/repo", response_model=RepoAnalysisResponse)
 async def analyze_repo(
     req: AnalyzeRequest,
+    max_commits: int = Query(default=500, ge=10, le=5000),
+    decay_warning_days: int = Query(default=60, ge=7, le=365),
+    decay_critical_days: int = Query(default=90, ge=14, le=730),
+    decay_critical_commits: int = Query(default=3, ge=1, le=50),
+    decay_critical_change_pct: float = Query(default=30.0, ge=5.0, le=100.0),
+    bus_factor_threshold: float = Query(default=0.50, ge=0.1, le=0.9),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -81,6 +88,22 @@ async def analyze_repo(
         token = decrypt_token(user.github_access_token_encrypted)
     except ValueError as e:
         raise TokenDecryptionError(f"Failed to decrypt stored token: {e}") from e
+
+    # Validate config parameters
+    if decay_critical_days <= decay_warning_days:
+        raise InvalidRepoURLError(
+            f"decay_critical_days ({decay_critical_days}) must be greater than decay_warning_days ({decay_warning_days})"
+        )
+
+    # Build config from query parameters
+    config = AnalysisConfig(
+        max_commits=max_commits,
+        decay_warning_days=decay_warning_days,
+        decay_critical_days=decay_critical_days,
+        decay_critical_commits=decay_critical_commits,
+        decay_critical_change_pct=decay_critical_change_pct,
+        bus_factor_threshold=bus_factor_threshold,
+    )
 
     client = github.GitHubClient(token=token)
     try:
@@ -99,22 +122,55 @@ async def analyze_repo(
     finally:
         await client.close()
 
-    files = analysis.build_contributor_map(commits)
+    # Apply config max_commits to commits list
+    commits = commits[:config.max_commits]
+
+    # Build contributor map with config
+    files = analysis.build_contributor_map(commits, config=config)
+
+    # ✅ FIXED: Use _resolve_author for safe author extraction
+    total_contributors = len(set(
+        analysis._resolve_author(commit)
+        for commit in commits if commit
+    ))
+
+    # Check if solo dev (single contributor across entire repo)
+    solo_developer_repo = total_contributors == 1
+
     response = RepoAnalysisResponse(
         repo=f"{owner}/{repo}",
         analyzed_at=datetime.now(timezone.utc).isoformat(),
         files=files,
+        total_contributors=total_contributors,
+        solo_developer_repo=solo_developer_repo,
+        config_used=config.to_dict(),
     )
 
-    # Persist the full result.
-    record = RepoAnalysis(
-        user_id=str(user.id),
-        repo_full_name=f"{owner}/{repo}",
-        platform="github",
-        analyzed_at=datetime.now(timezone.utc),
-        raw_result=response.model_dump(mode="json"),
+    # Persist the full result - upsert to avoid duplicate rows
+    result = await db.execute(
+        select(RepoAnalysis)
+        .where(RepoAnalysis.repo_full_name == f"{owner}/{repo}")
+        .where(RepoAnalysis.user_id == str(user.id))
+        .order_by(RepoAnalysis.analyzed_at.desc())
+        .limit(1)
     )
-    db.add(record)
+    record = result.scalars().first()
+
+    if record:
+        # Update existing record with fresh data
+        record.analyzed_at = datetime.now(timezone.utc)
+        record.raw_result = response.model_dump(mode="json")
+    else:
+        # Create new record
+        record = RepoAnalysis(
+            user_id=str(user.id),
+            repo_full_name=f"{owner}/{repo}",
+            platform="github",
+            analyzed_at=datetime.now(timezone.utc),
+            raw_result=response.model_dump(mode="json"),
+        )
+        db.add(record)
+
     await db.commit()
 
     return response
@@ -123,7 +179,6 @@ async def analyze_repo(
 
 @router.get("/repo/at-risk", response_model=AtRiskResponse)
 async def get_at_risk_files(
-    # FIX: query parameter, not path parameter — matches how it's actually called
     repo_full_name: str = Query(..., description="Repository in owner/repo format"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -134,7 +189,6 @@ async def get_at_risk_files(
     if "/" not in repo_full_name:
         raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
 
-    # Use scalars().first() to safely handle multiple stored rows for the same repo
     result = await db.execute(
         select(RepoAnalysis)
         .where(RepoAnalysis.repo_full_name == repo_full_name)
@@ -232,7 +286,6 @@ async def get_analysis_history(
     """Return all repos the current user has analyzed, most recent first.
     Shows only the latest analysis per repo.
     """
-    # Get distinct repos with their latest analysis timestamp
     result = await db.execute(
         select(
             RepoAnalysis.repo_full_name,
@@ -245,12 +298,10 @@ async def get_analysis_history(
     )
     rows = result.fetchall()
 
-    # Group by repo_full_name, keeping only the most recent
     seen_repos: dict[str, AnalysisHistoryItem] = {}
     for row in rows:
         repo_name = row.repo_full_name
         if repo_name in seen_repos:
-            # Keep only the first (most recent) entry per repo
             continue
 
         files_data = (row.raw_result or {}).get("files", [])
@@ -348,13 +399,12 @@ def _compute_modules(files_data: list[dict]) -> list[ModuleInfo]:
             modules[module_name] = {
                 "files": [],
                 "bus_factors": [],
-                "owners": [],  # Will collect (owner, ownership_pct) pairs
+                "owners": [],
             }
 
         modules[module_name]["files"].append(f)
         modules[module_name]["bus_factors"].append(f.get("bus_factor", 0) or 0)
 
-        # Collect top contributors for top_owners
         for contrib in f.get("contributors", []):
             owner = contrib.get("author", "")
             pct = contrib.get("ownership_pct", 0) or 0
@@ -365,7 +415,6 @@ def _compute_modules(files_data: list[dict]) -> list[ModuleInfo]:
         files = data["files"]
         bus_factors = data["bus_factors"]
 
-        # Find critical/decaying/stable counts
         critical_files = sum(
             1 for f in files
             if (f.get("decay") or {}).get("status") == "critical"
@@ -379,16 +428,19 @@ def _compute_modules(files_data: list[dict]) -> list[ModuleInfo]:
         bus_factor_min = min(bus_factors) if bus_factors else 0
         bus_factor_avg = round(sum(bus_factors) / len(bus_factors), 1) if bus_factors else 0.0
 
-        # Determine risk_level
-        if bus_factor_min == 1 or critical_files > 0:
+        # ✅ FIXED: Include solo_developer in critical check
+        any_solo_dev = any(
+            (f.get("decay") or {}).get("solo_developer") is True
+            for f in files
+        )
+
+        if bus_factor_min == 1 or critical_files > 0 or any_solo_dev:
             risk_level = "critical"
         elif bus_factor_avg < 2 or decaying_files > 0:
             risk_level = "warning"
         else:
             risk_level = "healthy"
 
-        # Get top 3 unique owners by ownership_pct
-        # Sort by ownership_pct descending, then deduplicate by author
         sorted_owners = sorted(
             data["owners"],
             key=lambda x: x[1],
@@ -413,8 +465,6 @@ def _compute_modules(files_data: list[dict]) -> list[ModuleInfo]:
             top_owners=top_owners,
         ))
 
-    # Sort by risk_level (critical first, then warning, then healthy),
-    # then by critical_files descending within each tier
     risk_order = {"critical": 0, "warning": 1, "healthy": 2}
     result.sort(key=lambda x: (risk_order.get(x.risk_level, 3), -x.critical_files))
 
