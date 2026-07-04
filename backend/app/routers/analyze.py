@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from urllib.parse import unquote
+from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
@@ -22,6 +25,7 @@ from app.core.errors import (
     RepoNotFoundError,
     TokenDecryptionError,
 )
+from app.core.repo import normalize_repo_full_name, parse_repo_url
 from app.core.security import decrypt_token
 from app.db import get_db
 from app.models.analysis import RepoAnalysisResponse, AnalyzeRequest
@@ -49,22 +53,60 @@ class AtRiskResponse(BaseModel):
     files: list[AtRiskFile]
 
 
-def _parse_repo(repo_url: str) -> tuple[str, str]:
-    """Parse owner/repo from a full github.com URL or the short form.
-
-    Rejects non-github.com URLs (GitLab support is planned, not here).
-    """
-    repo_url = repo_url.strip().rstrip("/")
-    if "github.com" not in repo_url:
-        raise InvalidRepoURLError(
-            "Only github.com repositories are supported at this time. "
-            "Provide a URL like https://github.com/owner/repo."
+async def _persist_repo_analysis(
+    db: AsyncSession,
+    user_id: str,
+    repo_full_name: str,
+    now: datetime,
+    raw_result: dict,
+) -> None:
+    """Upsert analysis row, preserving repo_analysis_id on re-analyze."""
+    upsert_stmt = (
+        pg_insert(RepoAnalysis)
+        .values(
+            id=str(uuid4()),
+            user_id=user_id,
+            repo_full_name=repo_full_name,
+            platform="github",
+            analyzed_at=now,
+            raw_result=raw_result,
         )
-    repo_url = repo_url.split("github.com/", 1)[-1].removesuffix(".git")
-    parts = repo_url.split("/")
-    if len(parts) != 2 or not all(parts):
-        raise InvalidRepoURLError("repo_url must be 'owner/repo' or a github.com URL")
-    return parts[0], parts[1]
+        .on_conflict_do_update(
+            constraint="uq_user_repo",
+            set_={
+                "analyzed_at": now,
+                "raw_result": raw_result,
+            },
+        )
+    )
+    try:
+        await db.execute(upsert_stmt)
+        await db.commit()
+    except ProgrammingError as exc:
+        await db.rollback()
+        if "uq_user_repo" not in str(getattr(exc, "orig", exc)):
+            raise
+        # DB not yet at migration 0003 — fall back until migrations run
+        result = await db.execute(
+            select(RepoAnalysis)
+            .where(RepoAnalysis.repo_full_name == repo_full_name)
+            .where(RepoAnalysis.user_id == user_id)
+            .order_by(RepoAnalysis.analyzed_at.desc())
+            .limit(1)
+        )
+        record = result.scalars().first()
+        if record:
+            record.analyzed_at = now
+            record.raw_result = raw_result
+        else:
+            db.add(RepoAnalysis(
+                user_id=user_id,
+                repo_full_name=repo_full_name,
+                platform="github",
+                analyzed_at=now,
+                raw_result=raw_result,
+            ))
+        await db.commit()
 
 
 @router.post("/repo", response_model=RepoAnalysisResponse)
@@ -79,7 +121,8 @@ async def analyze_repo(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    owner, repo = _parse_repo(req.repo_url)
+    owner, repo = parse_repo_url(req.repo_url)
+    repo_full_name = f"{owner}/{repo}"
 
     # Decrypt the user's stored GitHub token for authenticated API calls.
     if not user.github_access_token_encrypted:
@@ -137,41 +180,25 @@ async def analyze_repo(
     # Check if solo dev (single contributor across entire repo)
     solo_developer_repo = total_contributors == 1
 
+    now = datetime.now(timezone.utc)
     response = RepoAnalysisResponse(
-        repo=f"{owner}/{repo}",
-        analyzed_at=datetime.now(timezone.utc).isoformat(),
+        repo=repo_full_name,
+        analyzed_at=now.isoformat(),
         files=files,
         total_contributors=total_contributors,
         solo_developer_repo=solo_developer_repo,
         config_used=config.to_dict(),
     )
 
-    # Persist the full result - upsert to avoid duplicate rows
-    result = await db.execute(
-        select(RepoAnalysis)
-        .where(RepoAnalysis.repo_full_name == f"{owner}/{repo}")
-        .where(RepoAnalysis.user_id == str(user.id))
-        .order_by(RepoAnalysis.analyzed_at.desc())
-        .limit(1)
+    raw_result = response.model_dump(mode="json")
+
+    await _persist_repo_analysis(
+        db=db,
+        user_id=str(user.id),
+        repo_full_name=repo_full_name,
+        now=now,
+        raw_result=raw_result,
     )
-    record = result.scalars().first()
-
-    if record:
-        # Update existing record with fresh data
-        record.analyzed_at = datetime.now(timezone.utc)
-        record.raw_result = response.model_dump(mode="json")
-    else:
-        # Create new record
-        record = RepoAnalysis(
-            user_id=str(user.id),
-            repo_full_name=f"{owner}/{repo}",
-            platform="github",
-            analyzed_at=datetime.now(timezone.utc),
-            raw_result=response.model_dump(mode="json"),
-        )
-        db.add(record)
-
-    await db.commit()
 
     return response
 
@@ -186,12 +213,11 @@ async def get_at_risk_files(
     """Return files with decay status 'decaying' or 'critical'.
     Pulls from stored analysis. Returns 404 if no analysis exists yet.
     """
-    if "/" not in repo_full_name:
-        raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
+    normalized_repo = normalize_repo_full_name(repo_full_name)
 
     result = await db.execute(
         select(RepoAnalysis)
-        .where(RepoAnalysis.repo_full_name == repo_full_name)
+        .where(RepoAnalysis.repo_full_name == normalized_repo)
         .where(RepoAnalysis.user_id == str(user.id))
         .order_by(RepoAnalysis.analyzed_at.desc())
         .limit(1)
@@ -200,7 +226,7 @@ async def get_at_risk_files(
 
     if analysis_row is None:
         raise RepoNotFoundError(
-            f"No analysis found for {repo_full_name}. "
+            f"No analysis found for {normalized_repo}. "
             "Run POST /codeknow/analyze/repo first."
         )
 
@@ -226,7 +252,7 @@ async def get_at_risk_files(
     at_risk_files.sort(key=lambda x: x.pct_changed_since_owner_left, reverse=True)
 
     return AtRiskResponse(
-        repo=repo_full_name,
+        repo=normalized_repo,
         analyzed_at=analysis_row.analyzed_at.isoformat(),
         total_at_risk=len(at_risk_files),
         files=at_risk_files,
@@ -332,14 +358,11 @@ async def get_stored_result(
     db: AsyncSession = Depends(get_db),
 ):
     """Fetch the full stored analysis for a repo without re-hitting GitHub."""
-    decoded_repo = unquote(repo_full_name)
-
-    if "/" not in decoded_repo:
-        raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
+    normalized_repo = normalize_repo_full_name(unquote(repo_full_name))
 
     result = await db.execute(
         select(RepoAnalysis)
-        .where(RepoAnalysis.repo_full_name == decoded_repo)
+        .where(RepoAnalysis.repo_full_name == normalized_repo)
         .where(RepoAnalysis.user_id == str(user.id))
         .order_by(RepoAnalysis.analyzed_at.desc())
         .limit(1)
@@ -348,13 +371,13 @@ async def get_stored_result(
 
     if analysis_row is None:
         raise RepoNotFoundError(
-            f"No analysis found for {decoded_repo}. "
+            f"No analysis found for {normalized_repo}. "
             "Run POST /codeknow/analyze/repo first."
         )
 
     raw = analysis_row.raw_result or {}
     return RepoAnalysisResponse(
-        repo=decoded_repo,
+        repo=normalized_repo,
         analyzed_at=analysis_row.analyzed_at.isoformat(),
         files=raw.get("files", []),
     )
@@ -478,14 +501,11 @@ async def get_modules(
     db: AsyncSession = Depends(get_db),
 ):
     """Module-level aggregation — rolls up file-level data to folder level."""
-    decoded_repo = unquote(repo_full_name)
-
-    if "/" not in decoded_repo:
-        raise InvalidRepoURLError("repo_full_name must be in 'owner/repo' format")
+    normalized_repo = normalize_repo_full_name(unquote(repo_full_name))
 
     result = await db.execute(
         select(RepoAnalysis)
-        .where(RepoAnalysis.repo_full_name == decoded_repo)
+        .where(RepoAnalysis.repo_full_name == normalized_repo)
         .where(RepoAnalysis.user_id == str(user.id))
         .order_by(RepoAnalysis.analyzed_at.desc())
         .limit(1)
@@ -494,7 +514,7 @@ async def get_modules(
 
     if analysis_row is None:
         raise RepoNotFoundError(
-            f"No analysis found for {decoded_repo}. "
+            f"No analysis found for {normalized_repo}. "
             "Run POST /codeknow/analyze/repo first."
         )
 
@@ -502,7 +522,7 @@ async def get_modules(
     files_data = raw.get("files", [])
 
     return ModulesResponse(
-        repo=decoded_repo,
+        repo=normalized_repo,
         analyzed_at=analysis_row.analyzed_at.isoformat(),
         modules=_compute_modules(files_data),
     )

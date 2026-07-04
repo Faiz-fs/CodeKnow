@@ -1,4 +1,5 @@
-"""CodeKnow FastAPI application entrypoint."""
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,9 +7,15 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.core.errors import CodeKnowException
-from app.routers import analyze, auth, github, health
+from app.routers import analyze, auth, github, health, graph
+from app.migrate import upgrade_db_schema
 
 settings = get_settings()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await upgrade_db_schema()
+    yield
 
 app = FastAPI(
     title="CodeKnow",
@@ -46,6 +53,7 @@ api_route.include_router(health.router)
 api_route.include_router(auth.router, prefix="/auth")
 api_route.include_router(analyze.router, prefix="/analyze")
 api_route.include_router(github.router, prefix="/github")
+api_route.include_router(graph.router, prefix="/graph")
 
 app.include_router(api_route)
 

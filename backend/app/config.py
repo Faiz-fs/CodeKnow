@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     # --- Repo listing (GET /repos) ---
     max_repos_to_fetch: int = 200  # caps total repos pulled from GitHub's /user/repos
 
+    # --- Knowledge Graph (Engine 2) ---
+    max_files_to_parse: int = 300      # cap on files parsed per repo
+    graph_fetch_concurrency: int = 15  # concurrent file content fetches
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.app_cors_origins.split(",") if o.strip()]

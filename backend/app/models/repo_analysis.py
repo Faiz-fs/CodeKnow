@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -27,3 +27,7 @@ class RepoAnalysis(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     raw_result: Mapped[dict] = mapped_column(JSONB)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "repo_full_name", name="uq_user_repo"),
+    )
