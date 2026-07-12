@@ -16,3 +16,8 @@ itsdangerous
 cryptography
 
 # OAuth
+
+# Graph analysis (Engine 3)
+networkx
+numpy
+scipy

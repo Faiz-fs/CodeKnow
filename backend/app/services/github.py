@@ -66,7 +66,7 @@ class GitHubClient:
 
     async def get_commits_with_details(self, owner: str, repo: str) -> list[dict]:
         """Fetch the commit list, then concurrently fetch each commit's detail
-        (with its `files` array). Honors rate-limit headers and caps concurrency.
+        (with its `files` list). Honors rate-limit headers and caps concurrency.
 
         Returns commits enriched with their `files` list, capped at
         MAX_COMMITS_TO_ANALYZE.
@@ -103,6 +103,37 @@ class GitHubClient:
         remaining = last.headers.get("X-RateLimit-Remaining")
         if remaining is not None and int(remaining) < RATE_LIMIT_LOW_WATER:
             await asyncio.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+
+    async def fetch_commit_file_lists(self, owner: str, repo: str,
+                                      max_commits: int | None = None) -> list[dict]:
+        """Return a compact list of commits with only sha and files_changed paths.
+
+        Each item: {"sha": str, "files_changed": [path, ...]}.
+
+        One GitHub API call per commit (to /commits/{sha}), so max_commits is
+        a hard cap (default from config) to avoid exhausting the rate limit.
+        """
+        settings = get_settings()
+        max_c = max_commits or settings.co_change_max_commits
+        commits = await self.get_commits(owner, repo)
+        commits = commits[:max_c]
+
+        semaphore = asyncio.Semaphore(settings.github_concurrent_requests)
+
+        async def _fetch_files(c: dict) -> dict:
+            async with semaphore:
+                sha = c.get("sha")
+                if not sha:
+                    return {"sha": "", "files_changed": []}
+                try:
+                    detail = await self.get_commit_detail(owner, repo, sha)
+                except httpx.HTTPError:
+                    return {"sha": sha, "files_changed": []}
+                files = [f.get("filename") for f in (detail.get("files") or []) if f.get("filename")]
+                await self._maybe_backoff()
+                return {"sha": sha, "files_changed": files}
+
+        return await asyncio.gather(*(_fetch_files(c) for c in commits))
 
     async def close(self) -> None:
         await self.client.aclose()

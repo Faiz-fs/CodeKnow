@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.core.errors import CodeKnowException
-from app.routers import analyze, auth, github, health, graph
+from app.routers import analyze, auth, github, health, graph, correlation
 from app.migrate import upgrade_db_schema
 
 settings = get_settings()
@@ -54,6 +54,7 @@ api_route.include_router(auth.router, prefix="/auth")
 api_route.include_router(analyze.router, prefix="/analyze")
 api_route.include_router(github.router, prefix="/github")
 api_route.include_router(graph.router, prefix="/graph")
+api_route.include_router(correlation.router, prefix="/correlation")
 
 app.include_router(api_route)
 

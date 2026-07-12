@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     max_files_to_parse: int = 300      # cap on files parsed per repo
     graph_fetch_concurrency: int = 15  # concurrent file content fetches
 
+    # --- Correlation Layer (Engine 3) ---
+    co_change_min_weight: float = 0.1
+    co_change_max_commits: int = 500
+    ppr_damping_factor: float = 0.85
+    edge_type_weight_multiplier: dict[str, float] = {"imports": 1.0, "calls": 1.0, "inherits": 1.0, "co_changes_with": 1.0}
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.app_cors_origins.split(",") if o.strip()]

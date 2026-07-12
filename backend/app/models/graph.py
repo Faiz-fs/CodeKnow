@@ -26,6 +26,7 @@ class EdgeType(str, enum.Enum):
     calls = "calls"
     writes_to = "writes_to"
     reads_from = "reads_from"
+    co_changes_with = "co_changes_with"
 
 
 class GraphNode(Base):
@@ -73,6 +74,34 @@ class GraphEdge(Base):
         index=True,
     )
     edge_type: Mapped[str] = mapped_column(String(50))  # EdgeType values
+    weight: Mapped[float] = mapped_column(default=1.0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class NodeRiskScore(Base):
+    """Correlation Layer: blast radius score per node, computed via Personalized PageRank."""
+    __tablename__ = "node_risk_scores"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4())
+    )
+    repo_analysis_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("repo_analyses.id", ondelete="CASCADE"),
+        index=True,
+    )
+    node_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("graph_nodes.id", ondelete="CASCADE"),
+        index=True,
+    )
+    blast_radius_score: Mapped[float] = mapped_column(nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("repo_analysis_id", "node_id", name="uq_node_risk_per_analysis"),
     )
